@@ -28,9 +28,14 @@ def default_get_identifier(obj_or_string):
 
         return obj_or_string
 
+    # Deferred models should be identified as if they were the underlying model.
+    module_name = obj_or_string._meta.module_name
+    if hasattr(obj_or_string, '_deferred') and obj_or_string._deferred:
+        module_name = obj_or_string._meta.proxy_for_model._meta.module_name
+
     return u"%s.%s.%s" % (
         obj_or_string._meta.app_label,
-        obj_or_string._meta.module_name,
+        module_name,
         obj_or_string._get_pk_val()
     )
 
