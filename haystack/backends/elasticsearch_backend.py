@@ -2,7 +2,8 @@ from __future__ import unicode_literals
 import datetime
 import re
 import warnings
-from django.conf import settings
+import pprint
+import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.db.models.loading import get_model
 from django.utils import six
@@ -16,10 +17,14 @@ from haystack.utils import get_identifier
 from haystack.utils import log as logging
 
 try:
-    import elasticsearch
-    from elasticsearch.helpers import bulk_index
-except ImportError:
-    raise MissingDependency("The 'elasticsearch' backend requires the installation of 'elasticsearch'. Please refer to the documentation.")
+    # Import the newer version which supports ES 1.x
+    import elasticsearch_one as elasticsearch_1x
+    import elasticsearch_one.helpers as elasticsearch_1x_helpers
+    # Import the older ES 0.9x
+    import elasticsearch as elasticsearch_9x
+    import elasticsearch.helpers as elasticsearch_9x_helpers
+except ImportError as e:
+    raise MissingDependency("The 'elasticsearch' backend requires the installation of 'elasticsearch'. Please refer to the documentation: %s"%e)
 
 
 DATETIME_REGEX = re.compile(
@@ -97,7 +102,16 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         if not 'INDEX_NAME' in connection_options:
             raise ImproperlyConfigured("You must specify a 'INDEX_NAME' in your settings for connection '%s'." % connection_alias)
 
-        self.conn = elasticsearch.Elasticsearch(connection_options['URL'], timeout=self.timeout, **connection_options.get('KWARGS', {}))
+        # Use different modules depending on the version.
+        if connection_options.get('ES_1X'):
+            self.elasticsearch = elasticsearch_1x
+            helpers = elasticsearch_1x_helpers
+        else:  
+            self.elasticsearch = elasticsearch_9x
+            helpers = elasticsearch_9x_helpers
+        self.conn = self.elasticsearch.Elasticsearch(connection_options['URL'], timeout=self.timeout, **connection_options.get('KWARGS', {}))
+        self.TransportError = self.elasticsearch.TransportError
+        self.es_bulk_index  =  helpers.bulk_index
         self.index_name = connection_options['INDEX_NAME']
         self.log = logging.getLogger('haystack')
         self.setup_complete = False
@@ -113,14 +127,18 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         create_index, update_settings = False, False
         try:
             self.existing_mapping = self.conn.indices.get_mapping(index=self.index_name)
-        except elasticsearch.TransportError as e:
+            if self.index_name in self.existing_mapping:
+                self.existing_mapping = self.existing_mapping[self.index_name]
+        except self.TransportError as e:
             if e.status_code in [404, 400]:
                 # There is no mapping, the index may not have been created
+                self.log.warning(e)
                 try:
                     self.conn.indices.status(index=self.index_name)
                     update_settings = True
                     self.log.debug("Index '%s' found, but no mapping. Updating settings."%(self.index_name))
                 except Exception, e:
+                    self.log.warning(e)
                     self.log.info("Index '%s' not found. Creating."%(self.index_name))
                     create_index = True
             elif not self.silently_fail:
@@ -141,7 +159,34 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
             }
         }
 
-        if current_mapping != self.existing_mapping:
+        if self.store_all == False:
+            current_mapping['modelresult'].update({
+                '_all' : {'enabled' : False},
+                '_source' : {'enabled' : False},
+            })
+
+        def diffs_exist(start, a, b):
+            '''
+            '''
+            for k, v in a.items():
+                if k not in b and k in b.get("mappings",{}):
+                    # Fix for ES 1.x, which stores the mapping one level deeper.
+                    b = b['mappings']
+                if k not in b:
+                    self.log.warn("Mapping for %s[%s] does not exist: %s"%(
+                        start, k, pprint.pformat(b.keys())))
+                    return True
+                elif v != b[k] and isinstance(b, dict):
+                    return diffs_exist(start + "[%s]"%k, v, b[k])
+                elif v != b[k]:    
+                    self.log.warn("Mapping for %s[%s] is different: %s"%(
+                        start, k,
+                        pprint.pformat(a[k]),
+                        pprint.pformat(b.get(k))))
+                    return True
+                else:
+                    return False
+        if diffs_exist("", current_mapping, self.existing_mapping):
             try:
                 # Make sure the index is there first.
                 if create_index:
@@ -160,7 +205,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         if not self.setup_complete:
             try:
                 self.setup()
-            except elasticsearch.TransportError as e:
+            except self.TransportError as e:
                 if not self.silently_fail:
                     raise
 
@@ -180,7 +225,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                 final_data['_id'] = final_data[ID]
 
                 prepped_docs.append(final_data)
-            except elasticsearch.TransportError as e:
+            except self.TransportError as e:
                 if not self.silently_fail:
                     raise
 
@@ -194,7 +239,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                     }
                 })
 
-        bulk_index(self.conn, prepped_docs, index=self.index_name, doc_type='modelresult')
+        self.es_bulk_index(self.conn, prepped_docs, index=self.index_name, doc_type='modelresult')
 
         if commit:
             self.conn.indices.refresh(index=self.index_name)
@@ -205,7 +250,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         if not self.setup_complete:
             try:
                 self.setup()
-            except elasticsearch.TransportError as e:
+            except self.TransportError as e:
                 if not self.silently_fail:
                     raise
 
@@ -217,11 +262,13 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
 
             if commit:
                 self.conn.indices.refresh(index=self.index_name)
-        except elasticsearch.TransportError as e:
-            if not self.silently_fail:
+        except self.TransportError as e:
+            if e.status_code == 404 and e.info.get('ok') and e.info.get('found') == False:
+                self.log.warning("Tried removing nonexistent document '%s' from ElasticSearch: %s.", doc_id, e)
+            elif not self.silently_fail:
                 raise
-
-            self.log.error("Failed to remove document '%s' from Elasticsearch: %s", doc_id, e)
+            else:
+                self.log.error("Failed to remove document '%s' from Elasticsearch: %s", doc_id, e)
 
     def clear(self, models=[], commit=True):
         # We actually don't want to do this here, as mappings could be
@@ -244,7 +291,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                 # a ``query`` root object. :/
                 query = {'query': {'query_string': {'query': " OR ".join(models_to_delete)}}}
                 self.conn.delete_by_query(index=self.index_name, doc_type='modelresult', body=query)
-        except elasticsearch.TransportError as e:
+        except self.TransportError as e:
             if not self.silently_fail:
                 raise
 
@@ -378,8 +425,14 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                     'date_histogram': {
                         'field': facet_fieldname,
                         'interval': interval,
-                    },
-                    'facet_filter': {
+                    } }
+                # [speedplane] We have changed the implementation. We now 
+                # filter the results without filtering the facet.
+                if 'filter' in kwargs:
+                    # Only support one filter.
+                    self.log.error("Multiple filters detected. Need to merge.")
+                if value.get('start_date') or value.get('end_date'):
+                    kwargs['filter'] = {
                         "range": {
                             facet_fieldname: {
                                 'from': self._from_python(value.get('start_date')),
@@ -387,7 +440,6 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                             }
                         }
                     }
-                }
 
         if query_facets is not None:
             kwargs.setdefault('facets', {})
@@ -417,13 +469,13 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
             filters.append({"terms": {DJANGO_CT: model_choices}})
 
         for q in narrow_queries:
+            # [speedplane] Only do query_string if string, otherwise pass dict.
+            if isinstance(q, (str, unicode)):
+                q = { 'query_string': { 'query': q } }
+
             filters.append({
                 'fquery': {
-                    'query': {
-                        'query_string': {
-                            'query': q
-                        },
-                    },
+                    'query': q,
                     '_cache': True,
                 }
             })
@@ -494,14 +546,14 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
 
         end_offset = kwargs.get('end_offset')
         start_offset = kwargs.get('start_offset', 0)
-        if end_offset is not None and end_offset > start_offset:
+        if end_offset is not None and end_offset >= start_offset:
             search_kwargs['size'] = end_offset - start_offset
 
         try:
             raw_results = self.conn.search(body=search_kwargs,
                                            index=self.index_name,
                                            doc_type='modelresult')
-        except elasticsearch.TransportError as e:
+        except self.TransportError as e:
             if not self.silently_fail:
                 raise
 
@@ -539,7 +591,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
 
         try:
             raw_results = self.conn.mlt(index=self.index_name, doc_type='modelresult', id=doc_id, mlt_fields=[field_name], **params)
-        except elasticsearch.TransportError as e:
+        except self.TransportError as e:
             if not self.silently_fail:
                 raise
 
@@ -589,7 +641,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         for raw_result in raw_results.get('hits', {}).get('hits', []):
             source = raw_result.get('_source', {}) # source may be turned off.
             id = raw_result['_id']
-            app_label, model_name, idnum = id.split('.')
+            app_label, model_name, idnum = id.split('.', 2)
             additional_fields = {}
             model = get_model(app_label, model_name)
 

@@ -78,6 +78,7 @@ class BaseSearchBackend(object):
         self.batch_size = connection_options.get('BATCH_SIZE', 1000)
         self.silently_fail = connection_options.get('SILENTLY_FAIL', True)
         self.distance_available = connection_options.get('DISTANCE_AVAILABLE', False)
+        self.store_all = connection_options.get('STORE_ALL', True)
 
     def update(self, index, iterable):
         """
