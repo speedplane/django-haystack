@@ -296,19 +296,23 @@ class UnifiedIndex(object):
         if not self._built:
             self.build()
 
+        # [speedplane] Ignore after the period for facets for nested objects, 
+        field, sep, rest = field.partition(".")
+        rest = sep + rest
+
         for fieldname, field_object in self.fields.items():
             if fieldname != field:
                 continue
 
             if hasattr(field_object, 'facet_for'):
                 if field_object.facet_for:
-                    return field_object.facet_for
+                    return field_object.facet_for + rest
                 else:
-                    return field_object.instance_name
+                    return field_object.instance_name + rest
             else:
-                return self._facet_fieldnames.get(field) or field
+                return (self._facet_fieldnames.get(field) or field) + rest
 
-        return field
+        return field + rest
 
     def all_searchfields(self):
         if not self._built:
